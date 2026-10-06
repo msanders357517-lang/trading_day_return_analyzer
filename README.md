@@ -2,6 +2,8 @@
 
 A GitHub-ready Streamlit app that compares one or many market tickers across a user-selected date range.
 
+https://tradingdayreturnanalyzer.streamlit.app/
+
 ## What it does
 
 - Accepts one ticker or multiple tickers.
