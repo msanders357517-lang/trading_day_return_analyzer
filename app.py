@@ -77,6 +77,13 @@ def fmt_num(v, suffix=""):
 
 @st.cache_data(show_spinner=False)
 def load_universe():
+    """
+    Load ETF_1000.xlsx when it is available.
+
+    If the workbook is not present in GitHub/Streamlit Cloud, fall back to a
+    built-in market universe so the app remains fully usable instead of
+    crashing with FileNotFoundError.
+    """
     root_file = Path("ETF_1000.xlsx")
     data_file = Path("data") / "ETF_1000.xlsx"
 
@@ -85,22 +92,112 @@ def load_universe():
     elif data_file.exists():
         workbook_path = data_file
     else:
-        raise FileNotFoundError(
-            "ETF_1000.xlsx was not found. Place it either at the repository root "
-            "or inside a data folder."
+        workbook_path = None
+
+    if workbook_path is not None:
+        df = pd.read_excel(workbook_path)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        if "Symbol" not in df.columns:
+            raise ValueError(
+                "ETF_1000.xlsx was found, but it does not contain a 'Symbol' column."
+            )
+
+        df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+        df = df[df["Symbol"].notna() & (df["Symbol"] != "") & (df["Symbol"] != "NAN")]
+        df = df.drop_duplicates("Symbol")
+
+        for col in [
+            "Assets",
+            "Stock Price",
+            "% Change",
+            "CAGR 1Y",
+            "CAGR 3Y",
+            "CAGR 5Y",
+            "CAGR 10Y",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        required_cols = [
+            "Fund Name",
+            "Assets",
+            "Leverage",
+            "CAGR 1Y",
+            "CAGR 3Y",
+            "CAGR 5Y",
+            "CAGR 10Y",
+        ]
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = np.nan if col != "Fund Name" and col != "Leverage" else ""
+
+    else:
+        # Built-in fallback universe used when ETF_1000.xlsx is unavailable.
+        fallback = [
+            ("SPY", "SPDR S&P 500 ETF Trust", ""),
+            ("VOO", "Vanguard S&P 500 ETF", ""),
+            ("IVV", "iShares Core S&P 500 ETF", ""),
+            ("VT", "Vanguard Total World Stock ETF", ""),
+            ("VTI", "Vanguard Total Stock Market ETF", ""),
+            ("QQQ", "Invesco QQQ Trust", ""),
+            ("DIA", "SPDR Dow Jones Industrial Average ETF Trust", ""),
+            ("IWM", "iShares Russell 2000 ETF", ""),
+            ("SCHD", "Schwab U.S. Dividend Equity ETF", ""),
+            ("VIG", "Vanguard Dividend Appreciation ETF", ""),
+            ("VYM", "Vanguard High Dividend Yield ETF", ""),
+            ("VEA", "Vanguard FTSE Developed Markets ETF", ""),
+            ("VWO", "Vanguard FTSE Emerging Markets ETF", ""),
+            ("VXUS", "Vanguard Total International Stock ETF", ""),
+            ("EWY", "iShares MSCI South Korea ETF", ""),
+            ("SMH", "VanEck Semiconductor ETF", ""),
+            ("SOXX", "iShares Semiconductor ETF", ""),
+            ("XLK", "Technology Select Sector SPDR Fund", ""),
+            ("XLF", "Financial Select Sector SPDR Fund", ""),
+            ("XLE", "Energy Select Sector SPDR Fund", ""),
+            ("XLV", "Health Care Select Sector SPDR Fund", ""),
+            ("XLI", "Industrial Select Sector SPDR Fund", ""),
+            ("XLP", "Consumer Staples Select Sector SPDR Fund", ""),
+            ("XLY", "Consumer Discretionary Select Sector SPDR Fund", ""),
+            ("XLU", "Utilities Select Sector SPDR Fund", ""),
+            ("XLRE", "Real Estate Select Sector SPDR Fund", ""),
+            ("XLC", "Communication Services Select Sector SPDR Fund", ""),
+            ("BUG", "Global X Cybersecurity ETF", ""),
+            ("HACK", "ETFMG Prime Cyber Security ETF", ""),
+            ("CIBR", "First Trust NASDAQ Cybersecurity ETF", ""),
+            ("GRID", "First Trust NASDAQ Clean Edge Smart Grid Infrastructure Index Fund", ""),
+            ("ARKQ", "ARK Autonomous Technology & Robotics ETF", ""),
+            ("BOTZ", "Global X Robotics & Artificial Intelligence ETF", ""),
+            ("ROBO", "ROBO Global Robotics and Automation Index ETF", ""),
+            ("TQQQ", "ProShares UltraPro QQQ", "3x Long"),
+            ("UPRO", "ProShares UltraPro S&P500", "3x Long"),
+            ("SPXL", "Direxion Daily S&P 500 Bull 3X Shares", "3x Long"),
+            ("SOXL", "Direxion Daily Semiconductor Bull 3X Shares", "3x Long"),
+            ("QLD", "ProShares Ultra QQQ", "2x Long"),
+            ("SSO", "ProShares Ultra S&P500", "2x Long"),
+            ("WLDU", "Leverage Shares 2x Long World Stock Daily ETF", "2x Long"),
+            ("BND", "Vanguard Total Bond Market ETF", ""),
+            ("AGG", "iShares Core U.S. Aggregate Bond ETF", ""),
+            ("TLT", "iShares 20+ Year Treasury Bond ETF", ""),
+            ("IEF", "iShares 7-10 Year Treasury Bond ETF", ""),
+            ("GLD", "SPDR Gold Shares", ""),
+            ("SLV", "iShares Silver Trust", ""),
+            ("VNQ", "Vanguard Real Estate ETF", ""),
+            ("DBC", "Invesco DB Commodity Index Tracking Fund", ""),
+        ]
+
+        df = pd.DataFrame(
+            fallback,
+            columns=["Symbol", "Fund Name", "Leverage"],
         )
 
-    df = pd.read_excel(workbook_path)
-    df.columns = [str(c).strip() for c in df.columns]
-    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-    df = df[df["Symbol"].notna() & (df["Symbol"] != "") & (df["Symbol"] != "NAN")]
-    df = df.drop_duplicates("Symbol")
+        df["Assets"] = np.nan
+        df["CAGR 1Y"] = np.nan
+        df["CAGR 3Y"] = np.nan
+        df["CAGR 5Y"] = np.nan
+        df["CAGR 10Y"] = np.nan
 
-    for col in ["Assets", "Stock Price", "% Change", "CAGR 1Y", "CAGR 3Y", "CAGR 5Y", "CAGR 10Y"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Always include WLDU even if it has not yet been added to the workbook.
+    # Always include WLDU even if the external workbook does not contain it.
     if "WLDU" not in set(df["Symbol"]):
         extra = {col: np.nan for col in df.columns}
         extra["Symbol"] = "WLDU"
@@ -110,8 +207,10 @@ def load_universe():
             extra["Leverage"] = "2x Long"
         df = pd.concat([df, pd.DataFrame([extra])], ignore_index=True)
 
-    if "Assets" in df.columns:
+    if "Assets" in df.columns and df["Assets"].notna().any():
         df = df.sort_values("Assets", ascending=False, na_position="last")
+    else:
+        df = df.sort_values("Symbol")
 
     return df.reset_index(drop=True)
 
@@ -443,7 +542,7 @@ else:
     selected_universe = universe.head(int(size_choice)).copy()
 
 st.sidebar.caption(
-    f"{len(selected_universe):,} ETFs selected from {len(universe):,} in your workbook."
+    f"{len(selected_universe):,} ETFs selected from {len(universe):,} available symbols."
 )
 
 if st.sidebar.button("Refresh market data"):
