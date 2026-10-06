@@ -52,61 +52,149 @@ def parse_tickers(raw: str) -> List[str]:
     return tickers
 
 
-@st.cache_data(ttl="1h", show_spinner=False)
+@st.cache_data(ttl="30m", show_spinner=False)
 def download_prices(
     tickers: Tuple[str, ...],
     start_date: str,
     inclusive_end_date: str,
 ) -> pd.DataFrame:
     """
-    Download daily adjusted prices.
+    Download daily adjusted close prices with a robust Yahoo/yfinance fallback.
 
-    yfinance treats `end` as exclusive, so add one calendar day to make the
-    Streamlit end-date control inclusive.
+    Flow:
+      1. Try one multi-ticker yf.download request.
+      2. If a ticker is missing, retry it individually with Ticker.history().
+      3. If no ticker succeeds, raise an error instead of returning an empty
+         DataFrame. Streamlit therefore will NOT cache an empty failure.
+
+    yfinance treats `end` as exclusive, so one calendar day is added to make
+    the app's end-date control inclusive.
     """
     if not tickers:
-        return pd.DataFrame()
+        raise ValueError("No ticker symbols were supplied.")
 
-    yf_end = (pd.Timestamp(inclusive_end_date) + pd.Timedelta(days=1)).date().isoformat()
+    yf_end = (
+        pd.Timestamp(inclusive_end_date) + pd.Timedelta(days=1)
+    ).date().isoformat()
 
-    data = yf.download(
-        tickers=list(tickers),
-        start=start_date,
-        end=yf_end,
-        interval="1d",
-        auto_adjust=True,
-        actions=False,
-        repair=True,
-        keepna=False,
-        progress=False,
-        threads=True,
-        group_by="column",
-        multi_level_index=True,
-    )
+    successful: Dict[str, pd.Series] = {}
+    errors: Dict[str, str] = {}
 
-    if data is None or data.empty:
-        return pd.DataFrame()
+    # ------------------------------------------------------------------
+    # ATTEMPT 1 — MULTI-TICKER DOWNLOAD
+    # ------------------------------------------------------------------
+    try:
+        data = yf.download(
+            tickers=list(tickers),
+            start=start_date,
+            end=yf_end,
+            interval="1d",
+            auto_adjust=True,
+            actions=False,
+            repair=True,
+            keepna=False,
+            progress=False,
+            threads=False,
+            group_by="column",
+            multi_level_index=True,
+            timeout=30,
+        )
 
-    # yfinance normally returns a MultiIndex because multi_level_index=True.
-    # Handle either shape defensively.
-    if isinstance(data.columns, pd.MultiIndex):
-        level0 = data.columns.get_level_values(0)
-        if "Close" not in level0:
-            raise ValueError("Downloaded data did not contain an adjusted Close field.")
-        close = data["Close"].copy()
-    else:
-        if "Close" not in data.columns:
-            raise ValueError("Downloaded data did not contain an adjusted Close field.")
-        close = data[["Close"]].copy()
-        close.columns = [tickers[0]]
+        if data is not None and not data.empty:
+            if isinstance(data.columns, pd.MultiIndex):
+                level0 = data.columns.get_level_values(0)
 
-    if isinstance(close, pd.Series):
-        close = close.to_frame(name=tickers[0])
+                if "Close" in level0:
+                    close = data["Close"].copy()
 
-    close.index = pd.to_datetime(close.index).tz_localize(None)
-    close = close.sort_index()
-    close = close.reindex(columns=list(tickers))
-    close = close.dropna(axis=1, how="all")
+                    if isinstance(close, pd.Series):
+                        close = close.to_frame(name=tickers[0])
+
+                    for ticker in tickers:
+                        if ticker in close.columns:
+                            s = pd.to_numeric(close[ticker], errors="coerce").dropna()
+                            if not s.empty:
+                                successful[ticker] = s
+
+            else:
+                # Defensive single-ticker shape.
+                if "Close" in data.columns and len(tickers) == 1:
+                    s = pd.to_numeric(data["Close"], errors="coerce").dropna()
+                    if not s.empty:
+                        successful[tickers[0]] = s
+
+    except Exception as exc:
+        errors["BATCH"] = f"{type(exc).__name__}: {exc}"
+
+    # ------------------------------------------------------------------
+    # ATTEMPT 2 — INDIVIDUAL TICKER FALLBACK
+    # ------------------------------------------------------------------
+    missing = [ticker for ticker in tickers if ticker not in successful]
+
+    for ticker in missing:
+        try:
+            hist = yf.Ticker(ticker).history(
+                start=start_date,
+                end=yf_end,
+                interval="1d",
+                auto_adjust=True,
+                actions=False,
+                repair=True,
+                keepna=False,
+                timeout=30,
+                raise_errors=True,
+            )
+
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                s = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+                if not s.empty:
+                    successful[ticker] = s
+                    continue
+
+            errors[ticker] = "Yahoo Finance returned no daily price rows."
+
+        except Exception as exc:
+            errors[ticker] = f"{type(exc).__name__}: {exc}"
+
+    if not successful:
+        details = " | ".join(f"{k}: {v}" for k, v in errors.items())
+        raise RuntimeError(
+            "Yahoo Finance/yfinance returned no usable history for any requested "
+            f"ticker. {details}"
+        )
+
+    # ------------------------------------------------------------------
+    # NORMALIZE OUTPUT
+    # ------------------------------------------------------------------
+    normalized: Dict[str, pd.Series] = {}
+
+    for ticker, series in successful.items():
+        s = series.copy()
+        idx = pd.to_datetime(s.index)
+
+        # Remove timezone safely if Yahoo supplied one.
+        try:
+            if idx.tz is not None:
+                idx = idx.tz_convert(None)
+        except Exception:
+            try:
+                idx = idx.tz_localize(None)
+            except Exception:
+                pass
+
+        s.index = idx
+        s = s[~s.index.duplicated(keep="last")]
+        s = s.sort_index()
+        normalized[ticker] = s
+
+    close = pd.DataFrame(normalized).sort_index()
+    close = close.reindex(columns=[t for t in tickers if t in close.columns])
+
+    if close.empty:
+        raise RuntimeError(
+            "Price rows were downloaded but could not be normalized into a usable table."
+        )
+
     return close
 
 
@@ -488,15 +576,22 @@ with st.spinner("Downloading and analyzing market data..."):
             end_date.isoformat(),
         )
     except Exception as exc:
-        st.error(f"Market data download failed: {exc}")
+        st.error("Yahoo Finance could not return usable market data.")
+        st.code(str(exc), language=None)
+        st.info(
+            "Try Run Analysis again in a few seconds. If this works locally but "
+            "not on Streamlit Community Cloud, Yahoo may be temporarily rate-limiting "
+            "the cloud server. The app now retries each ticker individually before "
+            "showing this message."
+        )
         st.stop()
-
-if close.empty:
-    st.error("No usable price history was returned for the requested symbols and dates.")
-    st.stop()
 
 available = list(close.columns)
 missing = [t for t in tickers if t not in available]
+
+st.success(
+    "Loaded Yahoo Finance history for: " + ", ".join(available)
+)
 
 if missing:
     st.warning(
