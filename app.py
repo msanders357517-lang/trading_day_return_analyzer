@@ -1,1046 +1,844 @@
+from __future__ import annotations
 
-import io
-import os
+from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from fredapi import Fred
-from pathlib import Path
+
+
+APP_TITLE = "Trading Day & Investment Return Analyzer"
+FREQUENCIES = [
+    "Daily",
+    "Weekly",
+    "Semimonthly",
+    "Monthly",
+    "Quarterly",
+    "Annually",
+]
 
 st.set_page_config(
-    page_title="ETF Performance & Economic Dashboard",
+    page_title=APP_TITLE,
     page_icon="📈",
     layout="wide",
 )
 
-# ============================================================
-# CONSTANTS
-# ============================================================
 
-PERIODS = [
-    "1D", "1W", "2W", "1M", "3M", "6M", "1Y",
-    "3Y CAGR", "5Y CAGR", "10Y CAGR"
-]
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def parse_tickers(raw: str) -> List[str]:
+    """Accept comma-, semicolon-, space-, or newline-separated symbols."""
+    cleaned = (
+        raw.replace(",", " ")
+        .replace(";", " ")
+        .replace("\n", " ")
+        .replace("\t", " ")
+    )
+    tickers: List[str] = []
+    seen = set()
 
-WINDOWS = {
-    "1D": 1,
-    "1W": 5,
-    "2W": 10,
-    "1M": 21,
-    "3M": 63,
-    "6M": 126,
-    "1Y": 252,
-}
+    for token in cleaned.split():
+        ticker = token.strip().upper()
+        if ticker and ticker not in seen:
+            tickers.append(ticker)
+            seen.add(ticker)
 
-STRATEGIES = {
-    "Balanced": {
-        "1D": 0.02, "1W": 0.04, "2W": 0.05, "1M": 0.08,
-        "3M": 0.11, "6M": 0.15, "1Y": 0.16,
-        "3Y CAGR": 0.15, "5Y CAGR": 0.13, "10Y CAGR": 0.11,
-    },
-    "Short-Term Momentum": {
-        "1D": 0.05, "1W": 0.10, "2W": 0.12, "1M": 0.18,
-        "3M": 0.22, "6M": 0.20, "1Y": 0.13,
-    },
-    "Long-Term Growth": {
-        "1Y": 0.15, "3Y CAGR": 0.25, "5Y CAGR": 0.30, "10Y CAGR": 0.30,
-    },
-    "Consistency": {
-        "1M": 0.08, "3M": 0.12, "6M": 0.15, "1Y": 0.18,
-        "3Y CAGR": 0.18, "5Y CAGR": 0.16, "10Y CAGR": 0.13,
-    },
-    "Aggressive Growth": {
-        "1W": 0.05, "2W": 0.08, "1M": 0.12, "3M": 0.20,
-        "6M": 0.20, "1Y": 0.18, "3Y CAGR": 0.10, "5Y CAGR": 0.07,
-    },
-}
+    return tickers
 
-FRED_SERIES = {
-    "CPI Inflation": {
-        "series": "CPIAUCSL", "unit": "Index", "group": "Inflation",
-        "transform": "yoy", "display_unit": "%",
-    },
-    "Core CPI Inflation": {
-        "series": "CPILFESL", "unit": "Index", "group": "Inflation",
-        "transform": "yoy", "display_unit": "%",
-    },
-    "Core PCE Inflation": {
-        "series": "PCEPILFE", "unit": "Index", "group": "Inflation",
-        "transform": "yoy", "display_unit": "%",
-    },
-    "Unemployment Rate": {
-        "series": "UNRATE", "unit": "%", "group": "Labor",
-        "transform": "level", "display_unit": "%",
-    },
-    "Initial Jobless Claims": {
-        "series": "ICSA", "unit": "Claims", "group": "Labor",
-        "transform": "level", "display_unit": "",
-    },
-    "Federal Funds Rate": {
-        "series": "FEDFUNDS", "unit": "%", "group": "Fed & Rates",
-        "transform": "level", "display_unit": "%",
-    },
-    "10-Year Treasury": {
-        "series": "DGS10", "unit": "%", "group": "Fed & Rates",
-        "transform": "level", "display_unit": "%",
-    },
-    "2-Year Treasury": {
-        "series": "DGS2", "unit": "%", "group": "Fed & Rates",
-        "transform": "level", "display_unit": "%",
-    },
-    "10Y-2Y Yield Curve": {
-        "series": "T10Y2Y", "unit": "% pts", "group": "Fed & Rates",
-        "transform": "level", "display_unit": " pts",
-    },
-    "Real GDP": {
-        "series": "GDPC1", "unit": "Billions chained $", "group": "Growth",
-        "transform": "qoq_annualized", "display_unit": "%",
-    },
-    "Industrial Production": {
-        "series": "INDPRO", "unit": "Index", "group": "Growth",
-        "transform": "yoy", "display_unit": "%",
-    },
-    "Retail Sales": {
-        "series": "RSAFS", "unit": "Millions $", "group": "Consumers",
-        "transform": "yoy", "display_unit": "%",
-    },
-    "Consumer Sentiment": {
-        "series": "UMCSENT", "unit": "Index", "group": "Consumers",
-        "transform": "level", "display_unit": "",
-    },
-    "Housing Starts": {
-        "series": "HOUST", "unit": "Thousands", "group": "Housing",
-        "transform": "yoy", "display_unit": "%",
-    },
-    "15-Year Fixed Mortgage Rate": {
-        "series": "MORTGAGE15US", "unit": "%", "group": "Housing",
-        "transform": "level", "display_unit": "%",
-    },
-    "30-Year Fixed Mortgage Rate": {
-        "series": "MORTGAGE30US", "unit": "%", "group": "Housing",
-        "transform": "level", "display_unit": "%",
-    },
-}
 
-# ============================================================
-# HELPERS
-# ============================================================
+@st.cache_data(ttl="1h", show_spinner=False)
+def download_prices(
+    tickers: Tuple[str, ...],
+    start_date: str,
+    inclusive_end_date: str,
+) -> pd.DataFrame:
+    """
+    Download daily adjusted prices.
 
-def pct(v):
-    return "—" if pd.isna(v) else f"{v:.2%}"
-
-def money(v):
-    return "—" if pd.isna(v) else f"${v:,.2f}"
-
-def fmt_num(v, suffix=""):
-    if pd.isna(v):
-        return "—"
-    if abs(v) >= 1_000_000:
-        return f"{v/1_000_000:,.2f}M{suffix}"
-    if abs(v) >= 1_000:
-        return f"{v/1_000:,.2f}K{suffix}"
-    return f"{v:,.2f}{suffix}"
-
-@st.cache_data(show_spinner=False)
-def load_universe():
-    root_file = Path("ETF_1000.xlsx")
-    data_file = Path("data") / "ETF_1000.xlsx"
-
-    if root_file.exists():
-        workbook_path = root_file
-    elif data_file.exists():
-        workbook_path = data_file
-    else:
-        raise FileNotFoundError(
-            "ETF_1000.xlsx was not found. Place it either at the repository root "
-            "or inside a data folder."
-        )
-
-    df = pd.read_excel(workbook_path)
-    df.columns = [str(c).strip() for c in df.columns]
-    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-    df = df[df["Symbol"].notna() & (df["Symbol"] != "") & (df["Symbol"] != "NAN")]
-    df = df.drop_duplicates("Symbol")
-
-    for col in ["Assets", "Stock Price", "% Change", "CAGR 1Y", "CAGR 3Y", "CAGR 5Y", "CAGR 10Y"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Always include WLDU even if it has not yet been added to the workbook.
-    if "WLDU" not in set(df["Symbol"]):
-        extra = {col: np.nan for col in df.columns}
-        extra["Symbol"] = "WLDU"
-        if "Fund Name" in df.columns:
-            extra["Fund Name"] = "Leverage Shares 2x Long World Stock Daily ETF"
-        if "Leverage" in df.columns:
-            extra["Leverage"] = "2x Long"
-        df = pd.concat([df, pd.DataFrame([extra])], ignore_index=True)
-
-    if "Assets" in df.columns:
-        df = df.sort_values("Assets", ascending=False, na_position="last")
-
-    return df.reset_index(drop=True)
-
-def _close_frame(raw, tickers):
-    if raw is None or raw.empty:
+    yfinance treats `end` as exclusive, so add one calendar day to make the
+    Streamlit end-date control inclusive.
+    """
+    if not tickers:
         return pd.DataFrame()
-    if isinstance(raw.columns, pd.MultiIndex):
-        out = {}
-        level0 = set(raw.columns.get_level_values(0))
-        for t in tickers:
-            if t in level0:
-                sub = raw[t]
-                if "Close" in sub.columns:
-                    out[t] = sub["Close"]
-        return pd.DataFrame(out)
-    if len(tickers) == 1 and "Close" in raw.columns:
-        return pd.DataFrame({tickers[0]: raw["Close"]})
-    return pd.DataFrame()
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_prices(tickers_tuple, period="10y"):
-    tickers = list(tickers_tuple)
-    frames = []
-    failed = []
+    yf_end = (pd.Timestamp(inclusive_end_date) + pd.Timedelta(days=1)).date().isoformat()
 
-    for i in range(0, len(tickers), 75):
-        batch = tickers[i:i+75]
-        try:
-            raw = yf.download(
-                tickers=batch,
-                period=period,
-                interval="1d",
-                auto_adjust=True,
-                group_by="ticker",
-                progress=False,
-                threads=True,
-            )
-            frame = _close_frame(raw, batch)
-            if not frame.empty:
-                frames.append(frame)
-                failed.extend([t for t in batch if t not in frame.columns])
-            else:
-                failed.extend(batch)
-        except Exception:
-            failed.extend(batch)
+    data = yf.download(
+        tickers=list(tickers),
+        start=start_date,
+        end=yf_end,
+        interval="1d",
+        auto_adjust=True,
+        actions=False,
+        repair=True,
+        keepna=False,
+        progress=False,
+        threads=True,
+        group_by="column",
+        multi_level_index=True,
+    )
 
-    if not frames:
-        return pd.DataFrame(), sorted(set(failed))
+    if data is None or data.empty:
+        return pd.DataFrame()
 
-    df = pd.concat(frames, axis=1)
-    df = df.loc[:, ~df.columns.duplicated()]
-    return df.sort_index(), sorted(set(failed))
+    # yfinance normally returns a MultiIndex because multi_level_index=True.
+    # Handle either shape defensively.
+    if isinstance(data.columns, pd.MultiIndex):
+        level0 = data.columns.get_level_values(0)
+        if "Close" not in level0:
+            raise ValueError("Downloaded data did not contain an adjusted Close field.")
+        close = data["Close"].copy()
+    else:
+        if "Close" not in data.columns:
+            raise ValueError("Downloaded data did not contain an adjusted Close field.")
+        close = data[["Close"]].copy()
+        close.columns = [tickers[0]]
 
-def trailing_return(s, sessions):
-    s = s.dropna()
-    if len(s) <= sessions:
-        return np.nan
-    return float(s.iloc[-1] / s.iloc[-(sessions + 1)] - 1)
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=tickers[0])
 
-def cagr(s, years):
-    s = s.dropna()
-    if len(s) < 2:
-        return np.nan
-    target = s.index[-1] - pd.DateOffset(years=years)
-    x = s[s.index >= target]
-    if len(x) < 2:
-        return np.nan
-    actual_years = (x.index[-1] - x.index[0]).days / 365.25
-    if actual_years < years * 0.85:
-        return np.nan
-    if x.iloc[0] <= 0 or x.iloc[-1] <= 0:
-        return np.nan
-    return float((x.iloc[-1] / x.iloc[0]) ** (1 / actual_years) - 1)
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    close = close.sort_index()
+    close = close.reindex(columns=list(tickers))
+    close = close.dropna(axis=1, how="all")
+    return close
 
-def volatility(s):
-    r = s.dropna().pct_change().dropna()
-    return np.nan if len(r) < 30 else float(r.std() * np.sqrt(252))
 
-def max_drawdown(s):
-    s = s.dropna()
-    if len(s) < 2:
-        return np.nan
-    return float((s / s.cummax() - 1).min())
+def compute_daily_stats(series: pd.Series) -> Dict[str, float]:
+    s = series.dropna().astype(float)
+    returns = s.pct_change(fill_method=None).dropna()
 
-def trading_day_stats(series):
-    """Close-to-close win/loss analytics using adjusted prices."""
-    s = series.dropna().sort_index()
-    if len(s) < 2:
-        return None
-
-    returns = s.pct_change().dropna()
-    positive_r = returns[returns > 0]
-    negative_r = returns[returns < 0]
+    positive = int((returns > 0).sum())
+    negative = int((returns < 0).sum())
     flat = int((returns == 0).sum())
-    positive = int(len(positive_r))
-    negative = int(len(negative_r))
-    total = int(len(returns))
-    non_flat = positive + negative
+    directional = positive + negative
 
-    avg_win = float(positive_r.mean()) if positive else np.nan
-    avg_loss = float(negative_r.mean()) if negative else np.nan
-    payoff_ratio = (
-        avg_win / abs(avg_loss)
-        if pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0
-        else np.nan
-    )
+    win_pct = (positive / directional * 100.0) if directional else np.nan
+    loss_pct = (negative / directional * 100.0) if directional else np.nan
 
-    start_price = float(s.iloc[0])
-    end_price = float(s.iloc[-1])
-    total_return = end_price / start_price - 1 if start_price > 0 else np.nan
-    years = (s.index[-1] - s.index[0]).days / 365.25
-    history_cagr = (
-        (end_price / start_price) ** (1 / years) - 1
-        if start_price > 0 and end_price > 0 and years > 0
-        else np.nan
-    )
+    if len(s) >= 2:
+        elapsed_days = (s.index[-1] - s.index[0]).days
+        years = elapsed_days / 365.2425
+        total_return = s.iloc[-1] / s.iloc[0] - 1.0
+        cagr = ((s.iloc[-1] / s.iloc[0]) ** (1.0 / years) - 1.0) if years > 0 else np.nan
+    else:
+        elapsed_days = 0
+        years = 0
+        total_return = np.nan
+        cagr = np.nan
 
     return {
-        "Start Date": s.index[0].date(),
-        "End Date": s.index[-1].date(),
-        "Positive Days": positive,
-        "Negative Days": negative,
-        "Flat Days": flat,
-        "Trading Days": total,
-        "Non-Flat Days": non_flat,
-        # Win Rate intentionally excludes flat days.
-        "Win Rate": positive / non_flat if non_flat else np.nan,
-        # Positive-Day Rate includes flat days in the denominator for reference.
-        "Positive-Day Rate": positive / total if total else np.nan,
-        "Average Winning Day": avg_win,
-        "Average Losing Day": avg_loss,
-        "Win/Loss Payoff Ratio": payoff_ratio,
-        "Total Return": total_return,
-        "CAGR": history_cagr,
-        "Max Drawdown": max_drawdown(s),
+        "trading_days": int(len(s)),
+        "return_observations": int(len(returns)),
+        "positive_days": positive,
+        "negative_days": negative,
+        "flat_days": flat,
+        "win_pct": win_pct,
+        "loss_pct": loss_pct,
+        "asset_total_return": total_return,
+        "asset_cagr": cagr,
+        "first_price": float(s.iloc[0]) if len(s) else np.nan,
+        "last_price": float(s.iloc[-1]) if len(s) else np.nan,
+        "first_date": s.index[0] if len(s) else pd.NaT,
+        "last_date": s.index[-1] if len(s) else pd.NaT,
+        "years": years,
     }
 
 
-def trading_day_comparison(prices, tickers):
-    """Return own-history and common-period trading-day comparisons."""
-    own_rows = []
-    for ticker in tickers:
-        if ticker not in prices.columns:
-            continue
-        stats = trading_day_stats(prices[ticker])
-        if stats:
-            own_rows.append({"Symbol": ticker, **stats})
+def _scheduled_dates(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    frequency: str,
+) -> pd.DatetimeIndex:
+    """
+    Produce calendar contribution targets.
 
-    own = pd.DataFrame(own_rows)
-    if not own.empty:
-        own = own.sort_values(["Win Rate", "CAGR"], ascending=[False, False]).reset_index(drop=True)
-        own.insert(0, "Win-Rate Rank", range(1, len(own) + 1))
+    Actual purchases are moved to the first available trading day ON OR AFTER
+    each target date.
 
-    available = [t for t in tickers if t in prices.columns]
-    common_rows = []
-    common_start = None
-    common_end = None
+    Semimonthly = 1st and 15th of each month.
+    Weekly       = every 7 calendar days from the first available trading date.
+    Monthly      = first calendar day of each month.
+    Quarterly    = Jan/Apr/Jul/Oct first calendar day.
+    Annually     = Jan 1 of each year.
+    Daily        = handled directly from the trading-day index.
+    """
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
 
-    if len(available) >= 2:
-        aligned = prices[available].dropna(how="any").sort_index()
-        if len(aligned) >= 2:
-            common_start = aligned.index[0].date()
-            common_end = aligned.index[-1].date()
+    if frequency == "Weekly":
+        return pd.date_range(start=start, end=end, freq="7D")
 
-            for ticker in available:
-                stats = trading_day_stats(aligned[ticker])
-                if stats:
-                    common_rows.append({"Symbol": ticker, **stats})
+    if frequency == "Semimonthly":
+        months = pd.period_range(start=start.to_period("M"), end=end.to_period("M"), freq="M")
+        dates = []
+        for month in months:
+            first = month.start_time.normalize()
+            fifteenth = first + pd.Timedelta(days=14)
+            if start <= first <= end:
+                dates.append(first)
+            if start <= fifteenth <= end:
+                dates.append(fifteenth)
+        return pd.DatetimeIndex(dates)
 
-    common = pd.DataFrame(common_rows)
-    if not common.empty:
-        common = common.sort_values(["Win Rate", "CAGR"], ascending=[False, False]).reset_index(drop=True)
-        common.insert(0, "Win-Rate Rank", range(1, len(common) + 1))
+    if frequency == "Monthly":
+        dates = pd.date_range(start=start.to_period("M").start_time, end=end, freq="MS")
+        return dates[dates >= start]
 
-    return own, common, common_start, common_end
+    if frequency == "Quarterly":
+        dates = pd.date_range(start=start.to_period("Q").start_time, end=end, freq="QS")
+        return dates[dates >= start]
+
+    if frequency == "Annually":
+        dates = pd.date_range(start=pd.Timestamp(year=start.year, month=1, day=1), end=end, freq="YS")
+        return dates[dates >= start]
+
+    raise ValueError(f"Unsupported frequency: {frequency}")
 
 
-def build_metrics(prices, universe):
-    meta = universe.set_index("Symbol", drop=False)
+def map_targets_to_trading_days(
+    trading_days: pd.DatetimeIndex,
+    targets: Iterable[pd.Timestamp],
+) -> pd.DatetimeIndex:
+    """Map target dates to the first available trading day on/after each target."""
+    trading_days = pd.DatetimeIndex(trading_days).sort_values().unique()
+    if len(trading_days) == 0:
+        return pd.DatetimeIndex([])
+
+    mapped = []
+    for target in targets:
+        pos = trading_days.searchsorted(pd.Timestamp(target), side="left")
+        if pos < len(trading_days):
+            mapped.append(trading_days[pos])
+
+    return pd.DatetimeIndex(mapped).unique().sort_values()
+
+
+def contribution_dates(prices: pd.Series, frequency: str) -> pd.DatetimeIndex:
+    s = prices.dropna()
+    if s.empty:
+        return pd.DatetimeIndex([])
+
+    days = pd.DatetimeIndex(s.index)
+    if frequency == "Daily":
+        return days
+
+    targets = _scheduled_dates(days[0], days[-1], frequency)
+    return map_targets_to_trading_days(days, targets)
+
+
+def xnpv(rate: float, cashflows: List[Tuple[pd.Timestamp, float]]) -> float:
+    if rate <= -0.999999:
+        return np.inf
+
+    t0 = cashflows[0][0]
+    return sum(
+        amount / ((1.0 + rate) ** (((dt - t0).days / 365.2425)))
+        for dt, amount in cashflows
+    )
+
+
+def xirr(cashflows: List[Tuple[pd.Timestamp, float]]) -> float:
+    """Dependency-free XIRR via bracket expansion + bisection."""
+    if len(cashflows) < 2:
+        return np.nan
+
+    values = [v for _, v in cashflows]
+    if not (any(v < 0 for v in values) and any(v > 0 for v in values)):
+        return np.nan
+
+    low = -0.9999
+    high = 1.0
+
+    f_low = xnpv(low, cashflows)
+    f_high = xnpv(high, cashflows)
+
+    # Expand upper bracket for unusually strong returns.
+    for _ in range(60):
+        if np.sign(f_low) != np.sign(f_high):
+            break
+        high *= 2.0
+        f_high = xnpv(high, cashflows)
+        if high > 1_000_000:
+            return np.nan
+    else:
+        return np.nan
+
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        f_mid = xnpv(mid, cashflows)
+
+        if abs(f_mid) < 1e-8:
+            return mid
+
+        if np.sign(f_low) == np.sign(f_mid):
+            low = mid
+            f_low = f_mid
+        else:
+            high = mid
+
+    return (low + high) / 2.0
+
+
+@dataclass
+class InvestmentResult:
+    summary: Dict[str, float]
+    history: pd.DataFrame
+
+
+def simulate_investment(
+    prices: pd.Series,
+    initial_investment: float,
+    recurring_investment: float,
+    frequency: str,
+) -> InvestmentResult:
+    s = prices.dropna().astype(float).sort_index()
+    if s.empty:
+        return InvestmentResult({}, pd.DataFrame())
+
+    recurring_days = set(contribution_dates(s, frequency))
+    shares = 0.0
+    total_contributed = 0.0
     rows = []
-    for t in prices.columns:
-        s = prices[t].dropna()
-        if s.empty:
-            continue
-        r = {"Symbol": t}
-        for p, n in WINDOWS.items():
-            r[p] = trailing_return(s, n)
+    cashflows: List[Tuple[pd.Timestamp, float]] = []
 
-        r["3Y CAGR"] = cagr(s, 3)
-        r["5Y CAGR"] = cagr(s, 5)
-        r["10Y CAGR"] = cagr(s, 10)
-        r["Volatility"] = volatility(s)
-        r["Max Drawdown"] = max_drawdown(s)
-        r["Latest Price"] = float(s.iloc[-1])
-        r["Price Date"] = s.index[-1].date()
+    # Initial investment occurs on the first available trading day.
+    first_dt = s.index[0]
+    first_price = float(s.iloc[0])
+    if initial_investment > 0:
+        shares += initial_investment / first_price
+        total_contributed += initial_investment
+        cashflows.append((first_dt, -float(initial_investment)))
 
-        if t in meta.index:
-            m = meta.loc[t]
-            r["Fund Name"] = m.get("Fund Name", "")
-            r["Assets"] = m.get("Assets", np.nan)
-            r["Leverage"] = m.get("Leverage", "")
+    for dt, price in s.items():
+        contribution = 0.0
 
-            fallbacks = {
-                "1Y": m.get("CAGR 1Y", np.nan),
-                "3Y CAGR": m.get("CAGR 3Y", np.nan),
-                "5Y CAGR": m.get("CAGR 5Y", np.nan),
-                "10Y CAGR": m.get("CAGR 10Y", np.nan),
+        # Avoid double-counting the first day as both the initial deposit and a
+        # recurring contribution only if the user entered zero recurring amount.
+        # Otherwise, the recurring plan begins immediately, which is transparent
+        # and consistent across frequencies.
+        if dt in recurring_days and recurring_investment > 0:
+            contribution = float(recurring_investment)
+            shares += contribution / float(price)
+            total_contributed += contribution
+            cashflows.append((dt, -contribution))
+
+        value = shares * float(price)
+        rows.append(
+            {
+                "Date": dt,
+                "Price": float(price),
+                "Contribution": contribution,
+                "Cumulative Contributions": total_contributed,
+                "Shares": shares,
+                "Portfolio Value": value,
             }
-            for k, v in fallbacks.items():
-                if pd.isna(r.get(k)) and pd.notna(v):
-                    r[k] = float(v)
-
-        rows.append(r)
-
-    return pd.DataFrame(rows)
-
-def score_strategy(metrics, strategy):
-    df = metrics.copy()
-    weights = STRATEGIES[strategy]
-    score = pd.Series(0.0, index=df.index)
-    weight_used = pd.Series(0.0, index=df.index)
-
-    for c, w in weights.items():
-        if c not in df.columns:
-            continue
-        valid = df[c].notna()
-        rank = df[c].rank(pct=True, method="average")
-        score += rank.fillna(0) * w
-        weight_used += valid.astype(float) * w
-
-    df["Strategy Score"] = np.where(weight_used > 0, score / weight_used, np.nan)
-    df["Positive Periods"] = df[[c for c in PERIODS if c in df.columns]].gt(0).sum(axis=1)
-
-    if strategy == "Consistency":
-        avail = df[[c for c in PERIODS if c in df.columns]].notna().sum(axis=1)
-        breadth = np.where(avail > 0, df["Positive Periods"] / avail, 0)
-        vol_penalty = df["Volatility"].rank(pct=True).fillna(0.5)
-        dd_penalty = df["Max Drawdown"].abs().rank(pct=True).fillna(0.5)
-        df["Strategy Score"] = (
-            0.65 * df["Strategy Score"]
-            + 0.25 * breadth
-            + 0.05 * (1 - vol_penalty)
-            + 0.05 * (1 - dd_penalty)
         )
 
-    return df.sort_values("Strategy Score", ascending=False, na_position="last")
+    history = pd.DataFrame(rows).set_index("Date")
+    ending_value = float(history["Portfolio Value"].iloc[-1])
+    gain = ending_value - total_contributed
+    return_on_contributed = (
+        gain / total_contributed if total_contributed > 0 else np.nan
+    )
 
-def get_price_on_or_after(s, d):
-    x = s.dropna()
-    x = x[x.index >= pd.Timestamp(d)]
-    if x.empty:
-        return None, None
-    return x.index[0], float(x.iloc[0])
+    if ending_value > 0:
+        cashflows.append((history.index[-1], ending_value))
+    money_weighted_return = xirr(cashflows)
 
-def get_price_on_or_before(s, d):
-    x = s.dropna()
-    x = x[x.index <= pd.Timestamp(d)]
-    if x.empty:
-        return None, None
-    return x.index[-1], float(x.iloc[-1])
-
-def what_if(prices, ticker, amount, start, end):
-    if ticker not in prices.columns:
-        return None
-    s = prices[ticker]
-    sd, sp = get_price_on_or_after(s, start)
-    ed, ep = get_price_on_or_before(s, end)
-    if sp is None or ep is None or ed <= sd:
-        return None
-    shares = amount / sp
-    ending = shares * ep
-    years = (ed - sd).days / 365.25
-    return {
-        "Start Date": sd.date(),
-        "End Date": ed.date(),
-        "Start Price": sp,
-        "End Price": ep,
-        "Shares": shares,
-        "Initial Investment": amount,
-        "Ending Value": ending,
-        "Profit": ending - amount,
-        "Return": ending / amount - 1,
-        "CAGR": (ending / amount) ** (1 / years) - 1 if years > 0 else np.nan,
-    }
-
-def portfolio_backtest(prices, allocations, start, end):
-    details = []
-    total_initial = 0.0
-    total_ending = 0.0
-
-    for ticker, amount in allocations.items():
-        if amount <= 0:
-            continue
-        result = what_if(prices, ticker, amount, start, end)
-        if result is None:
-            continue
-        details.append({"Symbol": ticker, **result})
-        total_initial += amount
-        total_ending += result["Ending Value"]
-
-    if total_initial <= 0:
-        return None, pd.DataFrame()
-
-    years = (pd.Timestamp(end) - pd.Timestamp(start)).days / 365.25
     summary = {
-        "Initial": total_initial,
-        "Ending": total_ending,
-        "Profit": total_ending - total_initial,
-        "Return": total_ending / total_initial - 1,
-        "CAGR": (total_ending / total_initial) ** (1 / years) - 1 if years > 0 else np.nan,
+        "initial_investment": float(initial_investment),
+        "recurring_investment": float(recurring_investment),
+        "contribution_count": int((history["Contribution"] > 0).sum()),
+        "total_contributed": float(total_contributed),
+        "ending_value": ending_value,
+        "gain": float(gain),
+        "return_on_contributed": float(return_on_contributed),
+        "money_weighted_return": float(money_weighted_return),
+        "shares": float(shares),
     }
-    return summary, pd.DataFrame(details)
+    return InvestmentResult(summary, history)
 
-# ============================================================
-# FRED
-# ============================================================
 
-def get_fred_key():
-    key = ""
+def pct(value: float, decimals: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value * 100:.{decimals}f}%"
+
+
+def money(value: float) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"${value:,.2f}"
+
+
+def integer(value: float) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{int(value):,}"
+
+
+def build_csv(
+    summary_df: pd.DataFrame,
+    investment_df: pd.DataFrame,
+) -> bytes:
+    parts = [
+        "TRADING DAY STATISTICS\n",
+        summary_df.to_csv(index=False),
+        "\nINVESTMENT STATISTICS\n",
+        investment_df.to_csv(index=False),
+    ]
+    return "".join(parts).encode("utf-8")
+
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+st.title("📈 Trading Day & Investment Return Analyzer")
+st.caption(
+    "Compare positive vs. negative trading days, historical return/CAGR, "
+    "and recurring-investment outcomes for one or many tickers."
+)
+
+with st.sidebar:
+    st.header("Analysis Inputs")
+
+    ticker_text = st.text_area(
+        "Ticker(s)",
+        value="SPY, VT",
+        help="Enter one or many Yahoo Finance symbols separated by commas, spaces, or new lines.",
+        height=90,
+    )
+
+    today = date.today()
+    default_start = date(today.year - 10, today.month, min(today.day, 28))
+
+    start_date = st.date_input(
+        "Start date",
+        value=default_start,
+        max_value=today,
+    )
+    end_date = st.date_input(
+        "End date",
+        value=today,
+        max_value=today,
+    )
+
+    st.divider()
+    st.header("Investment Simulation")
+
+    initial_investment = st.number_input(
+        "Initial investment per ticker",
+        min_value=0.0,
+        value=5000.0,
+        step=500.0,
+        format="%.2f",
+    )
+    recurring_investment = st.number_input(
+        "Recurring contribution per ticker",
+        min_value=0.0,
+        value=300.0,
+        step=25.0,
+        format="%.2f",
+    )
+    frequency = st.selectbox(
+        "Contribution frequency",
+        FREQUENCIES,
+        index=3,
+    )
+
+    analyze = st.button("Run Analysis", type="primary", use_container_width=True)
+
+st.info(
+    "**Method:** A positive day means adjusted close > prior adjusted close; "
+    "a negative day means adjusted close < prior adjusted close. Flat days are "
+    "reported separately and excluded from win/loss percentages. Contributions "
+    "buy fractional shares at the adjusted closing price on the scheduled "
+    "trading day."
+)
+
+if not analyze:
+    st.stop()
+
+tickers = parse_tickers(ticker_text)
+
+if not tickers:
+    st.error("Enter at least one ticker.")
+    st.stop()
+
+if len(tickers) > 25:
+    st.error("Please analyze 25 or fewer tickers at one time.")
+    st.stop()
+
+if start_date >= end_date:
+    st.error("The start date must be earlier than the end date.")
+    st.stop()
+
+with st.spinner("Downloading and analyzing market data..."):
     try:
-        key = st.secrets.get("FRED_API_KEY", "")
-    except Exception:
-        pass
-    return key or os.getenv("FRED_API_KEY", "")
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fred_series(series_id, key):
-    fred = Fred(api_key=key)
-    s = fred.get_series(series_id)
-    s.index = pd.to_datetime(s.index)
-    return s.dropna().sort_index()
-
-def transform_fred(s, transform):
-    if transform == "yoy":
-        return s.pct_change(12) * 100
-    if transform == "qoq_annualized":
-        return ((s / s.shift(1)) ** 4 - 1) * 100
-    return s
-
-def fred_summary(s, transform):
-    t = transform_fred(s, transform).dropna()
-    if t.empty:
-        return None
-    latest = float(t.iloc[-1])
-    previous = float(t.iloc[-2]) if len(t) >= 2 else np.nan
-    year_ago = float(t.iloc[-13]) if len(t) >= 13 else np.nan
-    return {
-        "latest": latest,
-        "previous": previous,
-        "year_ago": year_ago,
-        "date": t.index[-1].date(),
-        "series": t,
-    }
-
-def trend_arrow(latest, previous):
-    if pd.isna(previous):
-        return "→"
-    if latest > previous:
-        return "↑"
-    if latest < previous:
-        return "↓"
-    return "→"
-
-# ============================================================
-# SIDEBAR / UNIVERSE
-# ============================================================
-
-universe = load_universe()
-
-st.sidebar.header("ETF Universe")
-size_choice = st.sidebar.selectbox(
-    "Ranking universe size",
-    [50, 100, 250, 500, "All"],
-    index=1,
-)
-if size_choice == "All":
-    selected_universe = universe.copy()
-else:
-    selected_universe = universe.head(int(size_choice)).copy()
-
-st.sidebar.caption(
-    f"{len(selected_universe):,} ETFs selected from {len(universe):,} in your workbook."
-)
-
-if st.sidebar.button("Refresh market data"):
-    fetch_prices.clear()
-    st.rerun()
-
-# Use 10Y for rankings; user controls universe size.
-with st.spinner("Loading ETF price history..."):
-    prices, failed = fetch_prices(tuple(selected_universe["Symbol"].tolist()), "10y")
-    metrics = build_metrics(prices, selected_universe) if not prices.empty else pd.DataFrame()
-
-# ============================================================
-# APP
-# ============================================================
-
-st.title("📈 ETF Performance & Portfolio Analyzer")
-st.caption(
-    "Rank ETFs across multiple horizons, compare trading-day win/loss statistics, test hypothetical "
-    "investments, backtest portfolios, and review important U.S. economic indicators."
-)
-
-tabs = st.tabs([
-    "🏆 ETF Leaders",
-    "🔎 ETF Analyzer",
-    "💰 What-If",
-    "📊 Portfolio",
-    "⭐ Rankings",
-    "🏛️ Economic Dashboard",
-])
-
-# ---------------- Leaders ----------------
-with tabs[0]:
-    st.subheader("ETF Leaders by Time Period")
-
-    if metrics.empty:
-        st.error("Market data could not be loaded for the selected ETF universe.")
-    else:
-        top_n = st.slider("Show top", 5, 25, 10)
-        period = st.selectbox("Period", PERIODS, index=5)
-
-        table = metrics.dropna(subset=[period]).sort_values(period, ascending=False).head(top_n)
-        cols = ["Symbol", "Fund Name", period, "Latest Price", "Assets", "Volatility", "Max Drawdown"]
-        cols = [c for c in cols if c in table.columns]
-        st.dataframe(
-            table[cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                period: st.column_config.NumberColumn(format="%.2f%%"),
-                "Latest Price": st.column_config.NumberColumn(format="$%.2f"),
-                "Volatility": st.column_config.NumberColumn(format="%.2f%%"),
-                "Max Drawdown": st.column_config.NumberColumn(format="%.2f%%"),
-            },
+        close = download_prices(
+            tuple(tickers),
+            start_date.isoformat(),
+            end_date.isoformat(),
         )
+    except Exception as exc:
+        st.error(f"Market data download failed: {exc}")
+        st.stop()
 
-        st.markdown("#### Top ETF in every period")
-        leader_rows = []
-        for p in PERIODS:
-            x = metrics.dropna(subset=[p]).sort_values(p, ascending=False)
-            if not x.empty:
-                r = x.iloc[0]
-                leader_rows.append({
-                    "Period": p,
-                    "Symbol": r["Symbol"],
-                    "Fund Name": r.get("Fund Name", ""),
-                    "Return": r[p],
-                })
-        leaders = pd.DataFrame(leader_rows)
-        st.dataframe(
-            leaders,
-            use_container_width=True,
-            hide_index=True,
-            column_config={"Return": st.column_config.NumberColumn(format="%.2f%%")},
-        )
+if close.empty:
+    st.error("No usable price history was returned for the requested symbols and dates.")
+    st.stop()
 
-        st.markdown("#### Repeat leaders")
-        top10_sets = []
-        for p in PERIODS:
-            top10_sets.extend(
-                metrics.dropna(subset=[p]).nlargest(10, p)["Symbol"].tolist()
-            )
-        counts = pd.Series(top10_sets).value_counts().rename("Top-10 Appearances").reset_index()
-        counts.columns = ["Symbol", "Top-10 Appearances"]
-        counts = counts.merge(
-            universe[["Symbol", "Fund Name"]].drop_duplicates(),
-            on="Symbol",
-            how="left",
-        )
-        st.dataframe(counts.head(25), use_container_width=True, hide_index=True)
+available = list(close.columns)
+missing = [t for t in tickers if t not in available]
 
-# ---------------- Analyzer ----------------
-with tabs[1]:
-    st.subheader("ETF Analyzer")
-    symbols = universe["Symbol"].tolist()
-    ticker = st.selectbox("ETF", symbols, index=0)
-
-    # Fetch ticker separately so any workbook ETF can be viewed even if outside ranking subset.
-    t_prices, _ = fetch_prices((ticker,), "10y")
-    if ticker not in t_prices.columns:
-        st.error("Price history unavailable for this ETF.")
-    else:
-        s = t_prices[ticker].dropna()
-        one = build_metrics(t_prices, universe)
-        row = one.iloc[0] if not one.empty else None
-
-        meta = universe[universe["Symbol"] == ticker].iloc[0]
-        st.markdown(f"### {ticker} — {meta.get('Fund Name', '')}")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Latest price", money(float(s.iloc[-1])))
-        c2.metric("1-year return", pct(row["1Y"]) if row is not None else "—")
-        c3.metric("5-year CAGR", pct(row["5Y CAGR"]) if row is not None else "—")
-        c4.metric("Max drawdown", pct(row["Max Drawdown"]) if row is not None else "—")
-
-        chart_period = st.selectbox("Chart history", ["1Y", "3Y", "5Y", "10Y"], index=2)
-        days = {"1Y": 365, "3Y": 365*3, "5Y": 365*5, "10Y": 365*10}[chart_period]
-        chart_s = s[s.index >= s.index[-1] - pd.Timedelta(days=days)]
-        st.line_chart(chart_s)
-
-        metric_table = pd.DataFrame({
-            "Period": PERIODS,
-            "Return": [row.get(p, np.nan) for p in PERIODS],
-        })
-        st.dataframe(
-            metric_table,
-            hide_index=True,
-            use_container_width=True,
-            column_config={"Return": st.column_config.NumberColumn(format="%.2f%%")},
-        )
-
-    st.markdown("---")
-    st.markdown("### Trading-Day Win/Loss Comparison")
-    st.caption(
-        "Win day = adjusted closing price finished above the prior trading day's adjusted close. "
-        "Win Rate excludes flat days. The table also shows average winning/losing day, payoff ratio, "
-        "CAGR, total return, and max drawdown. Use Own History for each ETF's full available history "
-        "and Common Period for a fair same-date comparison."
+if missing:
+    st.warning(
+        "No usable adjusted-close data was returned for: "
+        + ", ".join(missing)
     )
 
-    default_compare = [t for t in ["VT", "VOO", "SPY"] if t in universe["Symbol"].tolist()]
-    compare_tickers = st.multiselect(
-        "Compare ETFs",
-        universe["Symbol"].tolist(),
-        default=default_compare,
-        max_selections=6,
-        key="positive_day_tickers",
+stats_rows = []
+investment_rows = []
+histories: Dict[str, pd.DataFrame] = {}
+
+for ticker in available:
+    series = close[ticker].dropna()
+    if len(series) < 2:
+        continue
+
+    stats = compute_daily_stats(series)
+    investment = simulate_investment(
+        series,
+        float(initial_investment),
+        float(recurring_investment),
+        frequency,
     )
+    histories[ticker] = investment.history
 
-    if st.button("Run trading-day comparison", key="run_positive_day_comparison"):
-        if len(compare_tickers) < 2:
-            st.warning("Choose at least two ETFs.")
-        else:
-            with st.spinner("Loading full daily price history..."):
-                compare_prices, compare_failed = fetch_prices(tuple(compare_tickers), "max")
-
-            if compare_prices.empty:
-                st.error("Full price history could not be loaded.")
-            else:
-                own_stats, common_stats, common_start, common_end = trading_day_comparison(
-                    compare_prices, compare_tickers
-                )
-
-                st.markdown("#### Since each ETF's own available inception")
-                if not own_stats.empty:
-                    st.dataframe(
-                        own_stats,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Win Rate": st.column_config.NumberColumn(format="%.2f%%"),
-                            "Positive-Day Rate": st.column_config.NumberColumn(format="%.2f%%"),
-                            "Average Winning Day": st.column_config.NumberColumn(format="%.3f%%"),
-                            "Average Losing Day": st.column_config.NumberColumn(format="%.3f%%"),
-                            "Win/Loss Payoff Ratio": st.column_config.NumberColumn(format="%.2f"),
-                            "Total Return": st.column_config.NumberColumn(format="%.2f%%"),
-                            "CAGR": st.column_config.NumberColumn(format="%.2f%%"),
-                            "Max Drawdown": st.column_config.NumberColumn(format="%.2f%%"),
-                        },
-                    )
-
-                st.markdown("#### Same-date comparison")
-                if not common_stats.empty:
-                    st.caption(
-                        f"Common trading period: {common_start} through {common_end}. "
-                        "This removes the age difference between the ETFs."
-                    )
-                    st.dataframe(
-                        common_stats,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Win Rate": st.column_config.NumberColumn(format="%.2f%%"),
-                            "Positive-Day Rate": st.column_config.NumberColumn(format="%.2f%%"),
-                            "Average Winning Day": st.column_config.NumberColumn(format="%.3f%%"),
-                            "Average Losing Day": st.column_config.NumberColumn(format="%.3f%%"),
-                            "Win/Loss Payoff Ratio": st.column_config.NumberColumn(format="%.2f"),
-                            "Total Return": st.column_config.NumberColumn(format="%.2f%%"),
-                            "CAGR": st.column_config.NumberColumn(format="%.2f%%"),
-                            "Max Drawdown": st.column_config.NumberColumn(format="%.2f%%"),
-                        },
-                    )
-
-                    chart_df = common_stats[["Symbol", "Win Rate"]].copy()
-                    chart_df["Win Rate"] = chart_df["Win Rate"] * 100
-                    st.markdown("#### Win-rate ranking")
-                    st.bar_chart(
-                        chart_df.set_index("Symbol"),
-                        y="Win Rate",
-                    )
-
-                if compare_failed:
-                    st.warning(
-                        "Price history was unavailable for: " + ", ".join(compare_failed)
-                    )
-
-# ---------------- What If ----------------
-with tabs[2]:
-    st.subheader("What If I Had Invested?")
-    c1, c2 = st.columns(2)
-    with c1:
-        w_ticker = st.selectbox("ETF", universe["Symbol"].tolist(), key="whatif_ticker")
-        amount = st.number_input("Initial investment", min_value=1.0, value=10000.0, step=500.0)
-    with c2:
-        default_start = date.today() - timedelta(days=365*5)
-        start = st.date_input("Start date", value=default_start)
-        end = st.date_input("End date", value=date.today())
-
-    wp, _ = fetch_prices((w_ticker,), "10y")
-    result = what_if(wp, w_ticker, amount, start, end) if w_ticker in wp.columns else None
-
-    if result:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Initial", money(result["Initial Investment"]))
-        c2.metric("Ending value", money(result["Ending Value"]))
-        c3.metric("Profit", money(result["Profit"]))
-        c4.metric("Return", pct(result["Return"]))
-        st.write(
-            f"Historical shares purchased: **{result['Shares']:,.4f}** | "
-            f"Historical CAGR: **{pct(result['CAGR'])}**"
-        )
-        st.caption(
-            f"Uses adjusted closing prices from {result['Start Date']} through {result['End Date']}."
-        )
-    else:
-        st.info("Choose dates with available history.")
-
-# ---------------- Portfolio ----------------
-with tabs[3]:
-    st.subheader("Historical Portfolio Backtest")
-
-    portfolio_tickers = st.multiselect(
-        "Choose ETFs",
-        universe["Symbol"].tolist(),
-        default=universe["Symbol"].tolist()[:3],
-        max_selections=12,
-    )
-
-    p_start = st.date_input(
-        "Portfolio start date",
-        value=date.today() - timedelta(days=365*5),
-        key="p_start",
-    )
-    p_end = st.date_input("Portfolio end date", value=date.today(), key="p_end")
-
-    allocations = {}
-    if portfolio_tickers:
-        st.markdown("#### Starting allocations")
-        cols = st.columns(min(4, len(portfolio_tickers)))
-        for i, t in enumerate(portfolio_tickers):
-            with cols[i % len(cols)]:
-                allocations[t] = st.number_input(
-                    f"{t} starting $",
-                    min_value=0.0,
-                    value=5000.0,
-                    step=500.0,
-                    key=f"alloc_{t}",
-                )
-
-        pp, _ = fetch_prices(tuple(portfolio_tickers), "10y")
-        summary, details = portfolio_backtest(pp, allocations, p_start, p_end)
-
-        if summary:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Starting portfolio", money(summary["Initial"]))
-            c2.metric("Ending value", money(summary["Ending"]))
-            c3.metric("Profit", money(summary["Profit"]))
-            c4.metric("Portfolio return", pct(summary["Return"]))
-
-            st.dataframe(
-                details,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Start Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "End Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "Initial Investment": st.column_config.NumberColumn(format="$%.2f"),
-                    "Ending Value": st.column_config.NumberColumn(format="$%.2f"),
-                    "Profit": st.column_config.NumberColumn(format="$%.2f"),
-                    "Return": st.column_config.NumberColumn(format="%.2f%%"),
-                    "CAGR": st.column_config.NumberColumn(format="%.2f%%"),
-                },
-            )
-        else:
-            st.info("Enter at least one positive allocation with available price history.")
-
-# ---------------- Rankings ----------------
-with tabs[4]:
-    st.subheader("Rankings & Recommendation Signals")
-    st.caption(
-        "These are quantitative ranking signals, not personalized investment advice. "
-        "Scores are based on historical relative performance and, for Consistency, risk measures."
-    )
-
-    strategy = st.selectbox("Strategy", list(STRATEGIES.keys()))
-
-    if metrics.empty:
-        st.error("Ranking data unavailable.")
-    else:
-        ranked = score_strategy(metrics, strategy)
-        top = ranked.head(25).copy()
-
-        def label(row):
-            score = row["Strategy Score"]
-            if pd.isna(score):
-                return "Insufficient data"
-            if score >= 0.90:
-                return "Top-ranked"
-            if score >= 0.75:
-                return "Strong"
-            if score >= 0.55:
-                return "Above average"
-            if score >= 0.35:
-                return "Middle"
-            return "Weak relative score"
-
-        top["Signal"] = top.apply(label, axis=1)
-        show_cols = [
-            "Symbol", "Fund Name", "Strategy Score", "Signal",
-            "Positive Periods", "1M", "3M", "6M", "1Y",
-            "3Y CAGR", "5Y CAGR", "10Y CAGR", "Volatility", "Max Drawdown"
-        ]
-        show_cols = [c for c in show_cols if c in top.columns]
-
-        st.dataframe(
-            top[show_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Strategy Score": st.column_config.ProgressColumn(min_value=0, max_value=1),
-                "1M": st.column_config.NumberColumn(format="%.2f%%"),
-                "3M": st.column_config.NumberColumn(format="%.2f%%"),
-                "6M": st.column_config.NumberColumn(format="%.2f%%"),
-                "1Y": st.column_config.NumberColumn(format="%.2f%%"),
-                "3Y CAGR": st.column_config.NumberColumn(format="%.2f%%"),
-                "5Y CAGR": st.column_config.NumberColumn(format="%.2f%%"),
-                "10Y CAGR": st.column_config.NumberColumn(format="%.2f%%"),
-                "Volatility": st.column_config.NumberColumn(format="%.2f%%"),
-                "Max Drawdown": st.column_config.NumberColumn(format="%.2f%%"),
-            },
-        )
-
-# ---------------- FRED Dashboard ----------------
-with tabs[5]:
-    st.subheader("U.S. Economic Dashboard")
-    st.caption(
-        "Economic data from FRED, including 15-year and 30-year fixed mortgage rates. "
-        "Trend arrows compare the latest transformed reading with the prior reading."
-    )
-
-    fred_key = get_fred_key()
-
-    if not fred_key:
-        st.warning(
-            "FRED API key is not configured. Add FRED_API_KEY to Streamlit Secrets."
-        )
-        st.code('FRED_API_KEY = "your-key-here"', language="toml")
-    else:
-        group = st.selectbox(
-            "Indicator group",
-            ["All", "Inflation", "Labor", "Fed & Rates", "Growth", "Consumers", "Housing"],
-        )
-        lookback_years = st.slider("Chart lookback (years)", 1, 10, 5)
-
-        chosen = {
-            name: cfg for name, cfg in FRED_SERIES.items()
-            if group == "All" or cfg["group"] == group
+    stats_rows.append(
+        {
+            "Ticker": ticker,
+            "First Trading Date": stats["first_date"].date(),
+            "Last Trading Date": stats["last_date"].date(),
+            "Trading Days": stats["trading_days"],
+            "Positive Days": stats["positive_days"],
+            "Negative Days": stats["negative_days"],
+            "Flat Days": stats["flat_days"],
+            "Win %": stats["win_pct"],
+            "Loss %": stats["loss_pct"],
+            "Buy & Hold Return %": stats["asset_total_return"] * 100,
+            "CAGR %": stats["asset_cagr"] * 100,
+            "Start Price": stats["first_price"],
+            "End Price": stats["last_price"],
         }
+    )
 
-        summaries = []
-        series_cache = {}
+    inv = investment.summary
+    investment_rows.append(
+        {
+            "Ticker": ticker,
+            "Frequency": frequency,
+            "Initial Investment": inv["initial_investment"],
+            "Recurring Amount": inv["recurring_investment"],
+            "Recurring Purchases": inv["contribution_count"],
+            "Total Contributed": inv["total_contributed"],
+            "Ending Value": inv["ending_value"],
+            "Dollar Gain": inv["gain"],
+            "Return on Contributions %": inv["return_on_contributed"] * 100,
+            "Annualized Money-Weighted Return %": inv["money_weighted_return"] * 100,
+            "Ending Shares": inv["shares"],
+        }
+    )
 
-        with st.spinner("Loading FRED indicators..."):
-            for name, cfg in chosen.items():
-                try:
-                    raw = fred_series(cfg["series"], fred_key)
-                    sm = fred_summary(raw, cfg["transform"])
-                    if sm:
-                        series_cache[name] = sm["series"]
-                        summaries.append({
-                            "Indicator": name,
-                            "Group": cfg["group"],
-                            "Latest": sm["latest"],
-                            "Previous": sm["previous"],
-                            "Year Ago": sm["year_ago"],
-                            "Trend": trend_arrow(sm["latest"], sm["previous"]),
-                            "Date": sm["date"],
-                            "Unit": cfg["display_unit"],
-                        })
-                except Exception as e:
-                    summaries.append({
-                        "Indicator": name,
-                        "Group": cfg["group"],
-                        "Latest": np.nan,
-                        "Previous": np.nan,
-                        "Year Ago": np.nan,
-                        "Trend": "!",
-                        "Date": None,
-                        "Unit": "",
-                        "Error": str(e),
-                    })
+if not stats_rows:
+    st.error("The returned symbols did not contain enough observations to analyze.")
+    st.stop()
 
-        if summaries:
-            sdf = pd.DataFrame(summaries)
+stats_df = pd.DataFrame(stats_rows)
+investment_df = pd.DataFrame(investment_rows)
 
-            st.markdown("#### Key readings")
-            rows = [sdf.iloc[i:i+4] for i in range(0, len(sdf), 4)]
-            for block in rows:
-                cols = st.columns(len(block))
-                for col, (_, r) in zip(cols, block.iterrows()):
-                    latest = r["Latest"]
-                    prev = r["Previous"]
-                    unit = r["Unit"]
-                    if pd.isna(latest):
-                        col.metric(r["Indicator"], "Unavailable")
-                    else:
-                        if unit == "%":
-                            value = f"{latest:.2f}%"
-                            delta = None if pd.isna(prev) else f"{latest-prev:+.2f} pts"
-                        elif unit == " pts":
-                            value = f"{latest:.2f} pts"
-                            delta = None if pd.isna(prev) else f"{latest-prev:+.2f} pts"
-                        else:
-                            value = fmt_num(latest)
-                            delta = None if pd.isna(prev) else f"{latest-prev:+.2f}"
-                        col.metric(
-                            f"{r['Trend']} {r['Indicator']}",
-                            value,
-                            delta=delta,
-                        )
+# -----------------------------------------------------------------------------
+# Headline metrics
+# -----------------------------------------------------------------------------
+st.subheader("Overview")
+best_win = stats_df.loc[stats_df["Win %"].idxmax()]
+best_cagr = stats_df.loc[stats_df["CAGR %"].idxmax()]
+best_ending = investment_df.loc[investment_df["Ending Value"].idxmax()]
 
-            st.markdown("#### Indicator table")
-            st.dataframe(
-                sdf[["Indicator", "Group", "Latest", "Previous", "Year Ago", "Trend", "Date"]],
-                use_container_width=True,
-                hide_index=True,
+m1, m2, m3, m4 = st.columns(4)
+m1.metric(
+    "Highest Win Rate",
+    f'{best_win["Win %"]:.2f}%',
+    best_win["Ticker"],
+)
+m2.metric(
+    "Highest CAGR",
+    f'{best_cagr["CAGR %"]:.2f}%',
+    best_cagr["Ticker"],
+)
+m3.metric(
+    "Highest Ending Value",
+    money(best_ending["Ending Value"]),
+    best_ending["Ticker"],
+)
+m4.metric(
+    "Contribution Schedule",
+    frequency,
+    f"{money(recurring_investment)} each",
+)
+
+# -----------------------------------------------------------------------------
+# Trading-day statistics
+# -----------------------------------------------------------------------------
+st.subheader("Trading-Day Statistics")
+
+display_stats = stats_df.copy()
+for col in ["Win %", "Loss %", "Buy & Hold Return %", "CAGR %"]:
+    display_stats[col] = display_stats[col].map(lambda x: f"{x:,.2f}%")
+for col in ["Start Price", "End Price"]:
+    display_stats[col] = display_stats[col].map(lambda x: f"${x:,.2f}")
+
+st.dataframe(display_stats, use_container_width=True, hide_index=True)
+
+day_chart = stats_df.melt(
+    id_vars="Ticker",
+    value_vars=["Positive Days", "Negative Days", "Flat Days"],
+    var_name="Day Type",
+    value_name="Count",
+)
+fig_days = px.bar(
+    day_chart,
+    x="Ticker",
+    y="Count",
+    color="Day Type",
+    barmode="group",
+    title="Positive vs. Negative vs. Flat Trading Days",
+    text_auto=True,
+)
+fig_days.update_layout(legend_title_text="")
+st.plotly_chart(fig_days, width="stretch")
+
+win_chart = stats_df[["Ticker", "Win %", "Loss %"]].melt(
+    id_vars="Ticker",
+    var_name="Result",
+    value_name="Percent",
+)
+fig_win = px.bar(
+    win_chart,
+    x="Ticker",
+    y="Percent",
+    color="Result",
+    barmode="stack",
+    title="Win vs. Loss Percentage (Flat Days Excluded)",
+    text_auto=".2f",
+)
+fig_win.update_yaxes(range=[0, 100], ticksuffix="%")
+fig_win.update_layout(legend_title_text="")
+st.plotly_chart(fig_win, width="stretch")
+
+# -----------------------------------------------------------------------------
+# Historical growth line
+# -----------------------------------------------------------------------------
+st.subheader("Price Growth Comparison")
+normalized = pd.DataFrame()
+for ticker in available:
+    s = close[ticker].dropna()
+    if not s.empty:
+        normalized[ticker] = s / s.iloc[0] * 100.0
+
+normalized_long = (
+    normalized.reset_index()
+    .rename(columns={normalized.index.name or "index": "Date"})
+    .melt(id_vars="Date", var_name="Ticker", value_name="Growth of $100")
+    .dropna()
+)
+
+fig_growth = px.line(
+    normalized_long,
+    x="Date",
+    y="Growth of $100",
+    color="Ticker",
+    title="Historical Price Growth — $100 Indexed at Each Ticker's First Available Date",
+)
+fig_growth.update_yaxes(title="Indexed Value")
+st.plotly_chart(fig_growth, width="stretch")
+
+# -----------------------------------------------------------------------------
+# Investment simulation
+# -----------------------------------------------------------------------------
+st.subheader("Investment Simulation")
+st.caption(
+    f"Each ticker is simulated independently using {money(initial_investment)} "
+    f"initially plus {money(recurring_investment)} {frequency.lower()}."
+)
+
+display_inv = investment_df.copy()
+for col in [
+    "Initial Investment",
+    "Recurring Amount",
+    "Total Contributed",
+    "Ending Value",
+    "Dollar Gain",
+]:
+    display_inv[col] = display_inv[col].map(lambda x: f"${x:,.2f}")
+for col in [
+    "Return on Contributions %",
+    "Annualized Money-Weighted Return %",
+]:
+    display_inv[col] = display_inv[col].map(
+        lambda x: "N/A" if pd.isna(x) else f"{x:,.2f}%"
+    )
+display_inv["Ending Shares"] = display_inv["Ending Shares"].map(lambda x: f"{x:,.6f}")
+
+st.dataframe(display_inv, use_container_width=True, hide_index=True)
+
+value_chart = investment_df.melt(
+    id_vars="Ticker",
+    value_vars=["Total Contributed", "Ending Value"],
+    var_name="Measure",
+    value_name="Dollars",
+)
+fig_value = px.bar(
+    value_chart,
+    x="Ticker",
+    y="Dollars",
+    color="Measure",
+    barmode="group",
+    title="Total Contributions vs. Ending Portfolio Value",
+)
+fig_value.update_yaxes(tickprefix="$")
+fig_value.update_layout(legend_title_text="")
+st.plotly_chart(fig_value, width="stretch")
+
+portfolio_long_parts = []
+for ticker, history in histories.items():
+    if history.empty:
+        continue
+    piece = history[["Portfolio Value", "Cumulative Contributions"]].copy()
+    piece["Ticker"] = ticker
+    piece["Date"] = piece.index
+    portfolio_long_parts.append(piece.reset_index(drop=True))
+
+if portfolio_long_parts:
+    portfolio_long = pd.concat(portfolio_long_parts, ignore_index=True)
+    fig_portfolio = go.Figure()
+    for ticker in portfolio_long["Ticker"].unique():
+        subset = portfolio_long[portfolio_long["Ticker"] == ticker]
+        fig_portfolio.add_trace(
+            go.Scatter(
+                x=subset["Date"],
+                y=subset["Portfolio Value"],
+                mode="lines",
+                name=f"{ticker} value",
             )
+        )
+    fig_portfolio.update_layout(
+        title="Portfolio Value Over Time",
+        xaxis_title="Date",
+        yaxis_title="Portfolio Value",
+        yaxis_tickprefix="$",
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_portfolio, width="stretch")
 
-            indicator = st.selectbox("Chart indicator", list(series_cache.keys()))
-            s = series_cache[indicator]
-            cutoff = s.index[-1] - pd.DateOffset(years=lookback_years)
-            st.line_chart(s[s.index >= cutoff])
+# -----------------------------------------------------------------------------
+# Frequency comparison: all requested frequencies
+# -----------------------------------------------------------------------------
+st.subheader("All Contribution Frequencies")
+st.caption(
+    "This table applies the same recurring dollar amount to every schedule so "
+    "you can compare daily, weekly, semimonthly, monthly, quarterly, and annual "
+    "contribution patterns. Because the amount is per contribution, total dollars "
+    "contributed differ substantially by frequency."
+)
 
-            st.markdown("#### Trend guide")
-            st.write(
-                "↑ latest reading is above the prior reading • "
-                "↓ latest reading is below the prior reading • "
-                "→ little/no change"
-            )
+frequency_rows = []
+for ticker in available:
+    series = close[ticker].dropna()
+    if len(series) < 2:
+        continue
+    for freq in FREQUENCIES:
+        result = simulate_investment(
+            series,
+            float(initial_investment),
+            float(recurring_investment),
+            freq,
+        ).summary
+        frequency_rows.append(
+            {
+                "Ticker": ticker,
+                "Frequency": freq,
+                "Purchases": result["contribution_count"],
+                "Total Contributed": result["total_contributed"],
+                "Ending Value": result["ending_value"],
+                "Dollar Gain": result["gain"],
+                "Return on Contributions %": result["return_on_contributed"] * 100,
+                "Annualized Money-Weighted Return %": result["money_weighted_return"] * 100,
+            }
+        )
 
-# Footer
-if failed:
-    st.caption(
-        f"Some ticker histories were unavailable in the selected ranking universe: "
-        f"{', '.join(failed[:15])}"
-        + ("..." if len(failed) > 15 else "")
+freq_df = pd.DataFrame(frequency_rows)
+
+freq_display = freq_df.copy()
+for col in ["Total Contributed", "Ending Value", "Dollar Gain"]:
+    freq_display[col] = freq_display[col].map(lambda x: f"${x:,.2f}")
+for col in ["Return on Contributions %", "Annualized Money-Weighted Return %"]:
+    freq_display[col] = freq_display[col].map(
+        lambda x: "N/A" if pd.isna(x) else f"{x:,.2f}%"
+    )
+
+st.dataframe(freq_display, use_container_width=True, hide_index=True)
+
+fig_freq = px.bar(
+    freq_df,
+    x="Frequency",
+    y="Ending Value",
+    color="Ticker",
+    barmode="group",
+    category_orders={"Frequency": FREQUENCIES},
+    title="Ending Value by Contribution Frequency",
+)
+fig_freq.update_yaxes(tickprefix="$")
+st.plotly_chart(fig_freq, width="stretch")
+
+# -----------------------------------------------------------------------------
+# Downloads and notes
+# -----------------------------------------------------------------------------
+st.subheader("Export")
+st.download_button(
+    "Download Summary CSV",
+    data=build_csv(stats_df, investment_df),
+    file_name="trading_day_return_analysis.csv",
+    mime="text/csv",
+)
+
+with st.expander("Calculation Notes"):
+    st.markdown(
+        """
+- **Adjusted prices:** The app requests auto-adjusted daily Yahoo Finance prices through `yfinance`.
+- **Positive day:** Adjusted close is greater than the previous available trading day's adjusted close.
+- **Negative day:** Adjusted close is lower than the previous available trading day's adjusted close.
+- **Flat day:** Adjusted close is unchanged. Flat days do not count as wins or losses.
+- **Win %:** Positive Days ÷ (Positive Days + Negative Days).
+- **Buy & Hold Return:** End adjusted price ÷ Start adjusted price − 1.
+- **CAGR:** Annualized buy-and-hold price return over the actual elapsed calendar time.
+- **Recurring purchases:** Fractional shares are purchased using the adjusted close.
+- **Semimonthly:** Targets the 1st and 15th of each month and moves non-trading dates to the next available trading day.
+- **Other calendar schedules:** Weekly uses seven-day spacing from the first available trading date; monthly, quarterly, and annual schedules use the first applicable calendar date and move to the next available trading day.
+- **Return on Contributions:** (Ending Value − Total Contributed) ÷ Total Contributed. This is not annualized.
+- **Annualized Money-Weighted Return:** XIRR-style annualized return using the actual contribution dates and final portfolio value.
+- **Multiple tickers:** Each ticker is modeled independently using the same starting and recurring dollar amounts. The app does not split one contribution across all tickers.
+- **Data source:** Yahoo Finance through the open-source `yfinance` package. Market data can contain gaps, revisions, symbol changes, or provider limitations.
+        """
     )
 
 st.caption(
-    "Historical performance does not guarantee future results. "
-    "Ranking signals are informational and should not be treated as personalized investment advice."
+    "For research and educational use. Historical results do not guarantee future returns."
 )
